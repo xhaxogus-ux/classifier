@@ -4,10 +4,13 @@
 이 앱에서 서버가 필요한 유일한 자리다. **키를 숨기기 위해서** 존재한다.
 키를 app.js 에 적으면 브라우저 개발자 도구에서 그대로 보인다.
 
-  받는 것   {"texts": ["가려진 문장", ...최대 20개], "criteria": {...criteria.json...}}
-  주는 것   {"results": [{"category", "sentiment", "urgency", "reason"}, ...], "model": "..."}
-            키가 없거나 실패하면 {"results": null, "reason": "..."} — 200 으로 돌려준다.
+  받는 것   POST {"texts": ["가려진 문장", ...최대 20개], "criteria": {...criteria.json...},
+                  "model": "모델 이름" 또는 ""(빈 값이면 서버 기본값)}
+  주는 것   {"results": [{"category", "sentiment", "urgency", "reason"}, ...], "model": "실제로 쓴 모델"}
+            키가 없거나 실패하면 {"results": null, "reason": "...", "model": "..."} — 200 으로 돌려준다.
+            시간 초과면 "timeout": true 를 더 붙인다(화면이 그 묶음만 한 번 더 시도한다).
             **앱은 AI 없이도 규칙으로 계속 돈다.**
+  GET       {"default": "서버 기본 모델 이름"} 만 돌려준다. 키는 절대 돌려주지 않는다.
 
 문장은 브라우저에서 **이미 가려진 채로** 온다(mask.js). 여기서 다시 가리지 않는다 —
 서버에 도착했다는 것은 이미 내 컴퓨터를 떠났다는 뜻이다.
@@ -17,13 +20,18 @@
 """
 import json
 import os
+import re
+import socket
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler
 
 # 모델 이름과 무료 한도는 자주 바뀐다 — 00_지침/도구_무료확인.md 를 본다.
-#   2.5 계열은 예전 사용자에게만 열려 있다(2026-09). Vercel 환경 변수 GEMINI_MODEL 로 바꿀 수 있다.
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+#   고르는 순서: 요청의 "model" → Vercel 환경 변수 GEMINI_MODEL → 아래 기본값.
+#   화면의 모델 목록은 app.js 의 MODELS 에 있다.
+FALLBACK_MODEL = "gemini-3.8-flash"
+# 모델 이름은 호출 주소에 그대로 들어간다 — 글자·숫자·. _ - 만, 64자까지.
+MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]{0,63}$")
 ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 TIMEOUT = 60
 MAX_TEXTS = 20
@@ -60,13 +68,34 @@ def build_prompt(texts, crit):
 """
 
 
-def call_gemini(key, prompt):
+def default_model():
+    m = os.environ.get("GEMINI_MODEL", "").strip()
+    return m or FALLBACK_MODEL
+
+
+def resolve_model(asked):
+    """(쓸 모델, 거절 이유). 비어 있으면 서버 기본값. 이상한 이름은 AI를 부르지 않는다."""
+    asked = asked.strip() if isinstance(asked, str) else ""
+    model = asked or default_model()
+    if not MODEL_RE.fullmatch(model):
+        return None, "모델 이름이 올바르지 않습니다 — 영문·숫자·. _ - 만, 64자 이내"
+    return model, None
+
+
+def is_timeout(e):
+    """읽는 중 끊김(TimeoutError·socket.timeout)과 연결 중 끊김(URLError(reason=TimeoutError)) 둘 다."""
+    if isinstance(e, (TimeoutError, socket.timeout)):
+        return True
+    return isinstance(e, urllib.error.URLError) and isinstance(getattr(e, "reason", None), (TimeoutError, socket.timeout))
+
+
+def call_gemini(key, model, prompt):
     body = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
     }).encode("utf-8")
     req = urllib.request.Request(
-        ENDPOINT.format(model=MODEL), data=body, method="POST",
+        ENDPOINT.format(model=model), data=body, method="POST",
         headers={"Content-Type": "application/json", "x-goog-api-key": key})
     with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
         data = json.loads(r.read().decode("utf-8"))
@@ -100,20 +129,39 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def do_GET(self):
+        return self._send({"default": default_model()})
+
     def do_POST(self):
-        key = os.environ.get("GEMINI_API_KEY", "").strip()
-        if not key:
-            return self._send({"results": None, "reason": "키가 없습니다 — Vercel 환경 변수 GEMINI_API_KEY"})
+        model = default_model()
         try:
             n = int(self.headers.get("Content-Length", "0"))
             req = json.loads(self.rfile.read(min(n, 60000)).decode("utf-8"))
-            texts = [str(t)[:MAX_LEN] for t in req.get("texts", [])][:MAX_TEXTS]
+            if not isinstance(req, dict):
+                raise ValueError("본문이 객체가 아님")
+        except Exception:  # noqa: BLE001
+            return self._send({"results": None, "reason": "요청 본문을 읽지 못했습니다", "model": model})
+
+        model, bad = resolve_model(req.get("model"))
+        if bad:
+            return self._send({"results": None, "reason": bad, "model": None})
+
+        key = os.environ.get("GEMINI_API_KEY", "").strip()
+        if not key:
+            return self._send({"results": None, "reason": "키가 없습니다 — Vercel 환경 변수 GEMINI_API_KEY", "model": model})
+        try:
+            texts = [str(t)[:MAX_LEN] for t in (req.get("texts") or [])][:MAX_TEXTS]
             crit = req.get("criteria") or {}
             if not texts:
-                return self._send({"results": None, "reason": "보낸 문장이 없습니다"})
-            items = call_gemini(key, build_prompt(texts, crit))
-            return self._send({"results": clean(items, len(texts)), "model": MODEL})
-        except urllib.error.HTTPError as e:
-            return self._send({"results": None, "reason": f"AI 호출 실패 ({e.code}) — 모델 이름·한도를 확인"})
+                return self._send({"results": None, "reason": "보낸 문장이 없습니다", "model": model})
+            items = call_gemini(key, model, build_prompt(texts, crit))
+            return self._send({"results": clean(items, len(texts)), "model": model})
+        except urllib.error.HTTPError as e:  # URLError 보다 먼저 — HTTPError 는 URLError 의 자식이다
+            return self._send({"results": None, "model": model,
+                               "reason": f"AI 호출 실패 ({e.code}) — 모델({model}) 이름·한도를 확인"})
         except Exception as e:  # noqa: BLE001
-            return self._send({"results": None, "reason": f"AI 호출 실패 — {type(e).__name__}"})
+            if is_timeout(e):
+                return self._send({"results": None, "timeout": True, "model": model,
+                                   "reason": f"AI가 {TIMEOUT}초 안에 답하지 않았습니다 — 모델({model})이 느리거나 혼잡합니다"})
+            return self._send({"results": None, "model": model,
+                               "reason": f"AI 호출 실패 — 모델({model}) · {type(e).__name__}"})
